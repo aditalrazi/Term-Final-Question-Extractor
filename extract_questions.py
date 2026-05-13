@@ -46,17 +46,25 @@ except Exception:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Input PDF (the scanned question paper).
-PDF_PATH = r""
+PDF_PATH = r"C:\Users\Adit Al Razi\Downloads\Untitled 1.pdf"
 
 # Where the cropped images will be written.
 # >>> THIS IS THE LINE YOU'LL TYPICALLY WANT TO CHANGE <<<
-OUTPUT_DIR = r""
+OUTPUT_DIR = r"C:\Users\Adit Al Razi\Downloads\babas\questions"
 
 # Full path to the tesseract executable. Set to None to rely on PATH.
-TESSERACT_CMD = r""
+TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # ── Rendering ───────────────────────────────────────────────────────────────
 DPI = 220              # raise for sharper output, lower for speed
+
+# ── OCR backend ─────────────────────────────────────────────────────────────
+# "tesseract" — fast, runs on CPU, struggles with equations/diagrams.
+# "chandra"   — Chandra OCR 2 VLM via HuggingFace.  Much better on
+#               equations/diagrams.  Downloads ~10 GB of model weights on
+#               first run.  ~20-60 s per page on CPU, ~1 s per page on a
+#               modern GPU.  Requires `pip install "chandra-ocr[hf]"`.
+OCR_BACKEND = "tesseract"
 
 # ── Sub-part splitting ──────────────────────────────────────────────────────
 # When True, each question is split into one image per (a)/(b)/(c)/... part.
@@ -277,7 +285,16 @@ def detect_year(data: dict, page_height: int) -> str | None:
 def scan_page(
     img: Image.Image,
 ) -> tuple[list[tuple[int, int, str]], list[tuple[int, str]], str | None]:
-    """OCR a page once and return:
+    """Dispatch to the configured OCR backend."""
+    if OCR_BACKEND == "chandra":
+        return scan_page_chandra(img)
+    return scan_page_tesseract(img)
+
+
+def scan_page_tesseract(
+    img: Image.Image,
+) -> tuple[list[tuple[int, int, str]], list[tuple[int, str]], str | None]:
+    """OCR a page once (Tesseract) and return:
         questions  — [(question_num_guess, y_top, tier), …]   sorted by y
         subparts   — [(y_top, letter), …]                     sorted by y
         year       — "YYYY-YY" string if a paper header is found, else None
@@ -382,6 +399,153 @@ def scan_page(
     return cleaned_q, cleaned_sp, year
 
 
+# ─── Chandra OCR 2 backend ──────────────────────────────────────────────────
+# Cached model so we only pay the load cost once per script run.
+_chandra_model = None
+
+
+def _get_chandra_model():
+    """Lazy-load the Chandra OCR 2 model.  Imports happen here so the
+    Tesseract code path doesn't pull in torch/transformers."""
+    global _chandra_model
+    if _chandra_model is None:
+        try:
+            from chandra.model import InferenceManager
+        except ImportError as e:
+            sys.exit(
+                "Chandra OCR backend selected but the package isn't installed.\n"
+                "Run:  pip install \"chandra-ocr[hf]\"\n"
+                f"Original error: {e}"
+            )
+        print("Loading Chandra OCR 2 model (first run downloads ~10 GB)...")
+        _chandra_model = InferenceManager(method="hf")
+        print("  Model ready.")
+    return _chandra_model
+
+
+# Patterns applied to the plain-text content of each Chandra chunk.
+RE_CHUNK_COMBO = re.compile(
+    r"^\s*(\d{1,2})\s*[\.\,\:\;]?\s*\(\s*([a-z])\s*\)"
+)
+RE_CHUNK_Q     = re.compile(r"^\s*(\d{1,2})\s*[\.\,\:\;]")
+RE_CHUNK_SUB   = re.compile(r"^\s*\(\s*([a-z])\s*\)")
+
+
+def _chunk_plain_text(html_content: str) -> str:
+    """Strip HTML tags from a chunk's `content` field and collapse whitespace."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        # Cheap fallback: drop angle-bracket tags.
+        text = re.sub(r"<[^>]+>", " ", html_content)
+    else:
+        text = BeautifulSoup(html_content, "html.parser").get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _detect_year_in_text(text: str) -> str | None:
+    """Same validation as detect_year() but for a free-form text blob."""
+    for m in YEAR_RE.finditer(text):
+        y1 = int(m.group(1))
+        raw_y2 = m.group(2)
+        if len(raw_y2) == 2:
+            y2_full = (y1 // 100) * 100 + int(raw_y2)
+            if y2_full < y1:
+                y2_full += 100
+        else:
+            y2_full = int(raw_y2)
+        if y2_full - y1 in (0, 1):
+            return f"{y1}-{y2_full % 100:02d}"
+    return None
+
+
+def scan_page_chandra(
+    img: Image.Image,
+) -> tuple[list[tuple[int, int, str]], list[tuple[int, str]], str | None]:
+    """Chandra OCR 2 implementation of scan_page.
+
+    Chandra returns layout-level chunks (one per paragraph / table /
+    section-header) with pixel bboxes already in the source image's
+    coordinate system, so we can use them directly to locate question
+    and sub-part markers without any of Tesseract's pixel-margin
+    arithmetic.
+    """
+    from chandra.model.schema import BatchInputItem
+    model = _get_chandra_model()
+    results = model.generate(
+        [BatchInputItem(image=img, prompt_type="ocr_layout")],
+        include_headers_footers=True,
+    )
+    chunks = results[0].chunks
+
+    questions: list[tuple[int, int, str]] = []
+    subparts:  list[tuple[int, str]]    = []
+    year_seen: str | None = None
+    gap = int(img.height * MIN_SUBPART_GAP_FRAC)
+
+    for chunk in chunks:
+        label = chunk.get("label", "")
+        if label == "Blank-Page":
+            continue
+        bbox = chunk.get("bbox") or [0, 0, 0, 0]
+        if len(bbox) != 4:
+            continue
+        y_top = int(bbox[1])
+        text = _chunk_plain_text(chunk.get("content", ""))
+        if not text:
+            continue
+
+        # Year — check the very first chunks of the page (paper header).
+        if year_seen is None and label in ("Page-Header", "Section-Header",
+                                            "Text", "Caption"):
+            y = _detect_year_in_text(text)
+            if y:
+                year_seen = y
+
+        # Headers / footers don't host question markers
+        if label in ("Page-Header", "Page-Footer"):
+            continue
+
+        # Combo "1.(a)" / "5(a)" at chunk start
+        m = RE_CHUNK_COMBO.match(text)
+        if m:
+            num = int(m.group(1))
+            letter = m.group(2).lower()
+            if (1 <= num <= MAX_QUESTION_NUMBER
+                    and letter in SUBPART_LETTERS):
+                questions.append((num, y_top, "combo"))
+                subparts.append((y_top, letter))
+                continue
+
+        # Plain question marker at chunk start
+        m = RE_CHUNK_Q.match(text)
+        if m:
+            num = int(m.group(1))
+            if 1 <= num <= MAX_QUESTION_NUMBER:
+                questions.append((num, y_top, "strict"))
+                continue
+
+        # Plain sub-part marker at chunk start
+        m = RE_CHUNK_SUB.match(text)
+        if m:
+            letter = m.group(1).lower()
+            if letter in SUBPART_LETTERS:
+                subparts.append((y_top, letter))
+
+    questions.sort(key=lambda t: t[1])
+    subparts.sort(key=lambda t: t[0])
+
+    # De-dupe sub-parts that are too close vertically (rare with Chandra
+    # but keeps behaviour consistent with the Tesseract path).
+    cleaned_sp: list[tuple[int, str]] = []
+    for sp in subparts:
+        if cleaned_sp and sp[0] - cleaned_sp[-1][0] < gap:
+            continue
+        cleaned_sp.append(sp)
+
+    return questions, cleaned_sp, year_seen
+
+
 def collect_markers(
     doc: "fitz.Document",
 ) -> tuple[list[tuple[int, int, int, str]],
@@ -406,7 +570,11 @@ def collect_markers(
         if (page_idx + 1) in SKIP_PAGES:
             images.append(None)
             page_years.append(current_year)
-            print(f"  page {page_idx + 1}: skipped")
+            # Only announce skips when there are few — when a --page-range
+            # filter has pre-populated SKIP_PAGES with dozens of entries
+            # the chatter is noise.
+            if len(SKIP_PAGES) <= 10:
+                print(f"  page {page_idx + 1}: skipped")
             continue
         img = render_page(doc[page_idx], DPI)
         images.append(img)
@@ -567,6 +735,14 @@ def _parse_cli() -> argparse.Namespace:
     p.add_argument("--no-split", action="store_true",
                    help="Save each whole question as one image (don't split "
                         "by (a)/(b)/(c) sub-parts).")
+    p.add_argument("--backend", choices=("tesseract", "chandra"),
+                   default=OCR_BACKEND,
+                   help=f"OCR backend.  Default: {OCR_BACKEND!r}.  "
+                        "'chandra' is much slower but handles equations / "
+                        "diagrams better.")
+    p.add_argument("--page-range", type=str, default=None,
+                   help="Only process these pages (1-indexed), e.g. "
+                        "'1-5' or '1,3,7-9'.  Useful for Chandra timing tests.")
     return p.parse_args()
 
 
@@ -574,12 +750,34 @@ def main() -> None:
     args = _parse_cli()
 
     # Apply CLI overrides
-    global DPI, MAX_QUESTION_PAGES, SKIP_PAGES, SPLIT_SUB_PARTS
+    global DPI, MAX_QUESTION_PAGES, SKIP_PAGES, SPLIT_SUB_PARTS, OCR_BACKEND
     DPI = args.dpi
     MAX_QUESTION_PAGES = args.max_pages
     SKIP_PAGES = list(args.skip)
     if args.no_split:
         SPLIT_SUB_PARTS = False
+    OCR_BACKEND = args.backend
+
+    # `--page-range '1-5'` adds every page outside the range to SKIP_PAGES,
+    # which is the cheapest way to apply a subset filter end-to-end.
+    if args.page_range:
+        wanted: set[int] = set()
+        for span in args.page_range.split(","):
+            span = span.strip()
+            if "-" in span:
+                a, b = span.split("-", 1)
+                wanted.update(range(int(a), int(b) + 1))
+            elif span:
+                wanted.add(int(span))
+
+    # `wanted` was populated above when --page-range was passed.
+    if args.page_range:
+        configure_tesseract()    # harmless if backend is chandra
+        pdf_path_tmp = Path(args.pdf)
+        if pdf_path_tmp.exists():
+            with fitz.open(pdf_path_tmp) as _doc_tmp:
+                n_pages = len(_doc_tmp)
+            SKIP_PAGES = [i for i in range(1, n_pages + 1) if i not in wanted]
 
     configure_tesseract()
 
@@ -592,6 +790,7 @@ def main() -> None:
     print(f"Opening {pdf_path.name}")
     doc = fitz.open(pdf_path)
     print(f"  {len(doc)} pages, rendering at {DPI} DPI")
+    print(f"  OCR backend: {OCR_BACKEND}")
     print(f"  split sub-parts: {SPLIT_SUB_PARTS}\n")
 
     print("Scanning pages for markers...")

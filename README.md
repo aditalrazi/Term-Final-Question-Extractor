@@ -46,10 +46,21 @@ Multi-page sub-parts are stitched into one tall image automatically.
 | | |
 |---|---|
 | Python | 3.10 or newer |
-| Tesseract OCR | Installed system-wide |
-| Python packages | `pymupdf`, `pillow`, `pytesseract` |
+| Always | `pymupdf`, `pillow` |
+| Tesseract backend | Tesseract binary + `pytesseract` |
+| Chandra backend | `chandra-ocr[hf]` (downloads ~10 GB of model weights on first run) |
+
+The script ships with two OCR backends. Pick one via the `OCR_BACKEND`
+config knob or the `--backend` CLI flag:
+
+| Backend | Speed | Equations / diagrams | Install cost |
+|---|---|---|---|
+| `tesseract` (default) | ~1-2 s / page on CPU | Mediocre — known to misread `5(a)` as `58)`, `(s)` as a sub-part | small (~50 MB binary) |
+| `chandra` | ~20-60 s / page on CPU, ~1 s / page on GPU | Much better — VLM trained for technical documents | ~10 GB of model weights |
 
 ### One-time install
+
+**Tesseract backend (default):**
 
 ```powershell
 # Tesseract binary (Windows, via winget)
@@ -62,6 +73,31 @@ python -m pip install pymupdf pillow pytesseract
 Tesseract installs to `C:\Program Files\Tesseract-OCR\tesseract.exe` by
 default, which is what the script expects. If yours lives somewhere else,
 change `TESSERACT_CMD` in the script's CONFIG block.
+
+**Chandra backend (opt-in):**
+
+```powershell
+python -m pip install "chandra-ocr[hf]"
+```
+
+That installs PyTorch + transformers + chandra-ocr. The 10.6 GB model
+weights are downloaded automatically the first time you actually invoke
+the backend (via the HuggingFace cache, usually
+`~/.cache/huggingface/hub/`). After that, runs use the local copy.
+
+If your C: drive is tight, point the cache at another drive **before**
+the first run so the 10 GB lands there:
+
+```powershell
+# One-time, persists across sessions
+[Environment]::SetEnvironmentVariable("HF_HOME", "D:\hf_cache", "User")
+
+# For just the current shell
+$env:HF_HOME = "D:\hf_cache"
+```
+
+Make sure the target directory exists (`New-Item -Path D:\hf_cache
+-ItemType Directory`).
 
 ---
 
@@ -100,6 +136,8 @@ python extract_questions.py "input.pdf" "output_folder"
 | `--max-pages N` | 2 | Cap each question to this many pages (protects against OCR misses that would otherwise stretch one crop across many pages). |
 | `--skip P [P ...]` | (none) | 1-indexed page numbers to ignore entirely. Useful for cover pages, instructions, blank pages. |
 | `--no-split` | (off) | Save each whole question as one image instead of splitting by `(a)/(b)/(c)` sub-parts. |
+| `--backend {tesseract,chandra}` | `tesseract` | Which OCR engine to use. |
+| `--page-range RANGE` | (all) | Only process these 1-indexed pages, e.g. `--page-range 1-5` or `--page-range 1,3,7-9`. Useful for timing Chandra before a full run. |
 | `--help` | | Show usage. |
 
 Examples:
@@ -113,6 +151,12 @@ python extract_questions.py --no-split
 
 # Allow longer questions (up to 3 pages each)
 python extract_questions.py --max-pages 3
+
+# Run with Chandra OCR 2 on just pages 1-3 (good for first-time timing test)
+python extract_questions.py --backend chandra --page-range 1-3
+
+# Full PDF with Chandra (slow — plan to leave it running)
+python extract_questions.py --backend chandra
 ```
 
 ---
