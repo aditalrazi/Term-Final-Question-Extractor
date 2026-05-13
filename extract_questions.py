@@ -46,14 +46,14 @@ except Exception:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Input PDF (the scanned question paper).
-PDF_PATH = r"C:\Users\Adit Al Razi\Downloads\Untitled 1.pdf"
+PDF_PATH = r""
 
 # Where the cropped images will be written.
 # >>> THIS IS THE LINE YOU'LL TYPICALLY WANT TO CHANGE <<<
-OUTPUT_DIR = r"C:\Users\Adit Al Razi\Downloads\babas\questions"
+OUTPUT_DIR = r""
 
 # Full path to the tesseract executable. Set to None to rely on PATH.
-TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_CMD = r""
 
 # ── Rendering ───────────────────────────────────────────────────────────────
 DPI = 220              # raise for sharper output, lower for speed
